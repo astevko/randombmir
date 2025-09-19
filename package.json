@@ -1,0 +1,17 @@
+{
+  "name": "randombmir-audio-tools",
+  "version": "1.0.0",
+  "description": "Tools for managing BMIR audio metadata",
+  "scripts": {
+    "load-metadata": "tsx scripts/load-audio-metadata.ts",
+    "dev": "cd bmir-audio-player && npm run dev"
+  },
+  "dependencies": {
+    "use-fireproof": "^0.20.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.7.0",
+    "typescript": "^5"
+  }
+} 

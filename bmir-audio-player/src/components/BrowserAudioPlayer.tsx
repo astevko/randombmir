@@ -1,90 +1,81 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useFireproof } from 'use-fireproof';
 import { AudioClip } from '@/types/audio';
 import { audioDb } from '@/lib/audio-db';
+import { localStorageService } from '@/lib/local-storage-service';
 
-// Helper to get or create a session ID
+// Generate a unique session ID for this browser session
 function getSessionId() {
-  if (typeof window === 'undefined') return '';
-  let sessionId = localStorage.getItem('bmir_session_id');
+  if (typeof window === 'undefined') return 'default-session';
+  
+  let sessionId = localStorage.getItem('bmir-session-id');
   if (!sessionId) {
-    sessionId = crypto.randomUUID();
-    localStorage.setItem('bmir_session_id', sessionId);
+    sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem('bmir-session-id', sessionId);
   }
   return sessionId;
 }
 
 export default function BrowserAudioPlayer() {
+  const { useLiveQuery, database } = useFireproof("bmir-audio-player");
   const [currentClip, setCurrentClip] = useState<AudioClip | null>(null);
-  const [allClips, setAllClips] = useState<AudioClip[]>([]);
+  const [displayedClips, setDisplayedClips] = useState<AudioClip[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(1);
   const [isLoading, setIsLoading] = useState(true);
   const [showTranscript, setShowTranscript] = useState(false);
   const [fullTranscript, setFullTranscript] = useState('');
-  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
-  const [isEditing, setIsEditing] = useState(false);
   const [editedTranscript, setEditedTranscript] = useState('');
+  const [editedTitle, setEditedTitle] = useState('');
+  const [isEditing, setIsEditing] = useState(false);
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
-  const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [editedTitle, setEditedTitle] = useState('');
+  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
+  const [currentPage, setCurrentPage] = useState(0);
+  const [totalClips, setTotalClips] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   
   const audioRef = useRef<HTMLAudioElement>(null);
-  const { database } = useFireproof("bmir-audio-player");
   const sessionId = getSessionId();
+  
+  const PAGE_SIZE = 20; // Load 20 clips at a time
 
-  // Initialize database and load clips
+  // Initialize database and load initial state
   useEffect(() => {
     const initializePlayer = async () => {
       try {
-        setIsLoading(true);
         await audioDb.initializeDatabase(database);
         
-        // Try to get clips with retry logic
-        let clips: AudioClip[] = [];
-        let retryCount = 0;
-        const maxRetries = 3;
-        
-        while (retryCount < maxRetries) {
-          try {
-            clips = await audioDb.getAllClips(database);
-            break; // Success, exit the retry loop
-          } catch (error) {
-            retryCount++;
-            console.log(`Attempt ${retryCount} failed, retrying...`, error);
-            if (retryCount >= maxRetries) {
-              console.error('Max retries reached, clearing database and reloading...');
-              // Clear local storage and reload
-              const keys = Object.keys(localStorage);
-              const dbKeys = keys.filter(key => key.includes('bmir-audio-player'));
-              dbKeys.forEach(key => localStorage.removeItem(key));
-              window.location.reload();
-              return;
+        // Load saved playback state from localStorage
+        const savedState = await localStorageService.getPlayerState(sessionId);
+        if (savedState) {
+          setVolume(savedState.volume || 1);
+          setCurrentTime(savedState.currentTime || 0);
+          setIsPlaying(savedState.isPlaying || false);
+          
+          // Load the saved clip
+          if (savedState.currentClipId) {
+            const clip = await audioDb.getClipById(database, savedState.currentClipId);
+            if (clip) {
+              setCurrentClip(clip);
             }
-            // Wait a bit before retrying
-            await new Promise(resolve => setTimeout(resolve, 1000));
           }
         }
         
-        setAllClips(clips);
+        // Load first page of clips
+        await loadClipsPage(0);
         
-        // Fetch last played from Redis
-        let lastClipId = '';
-        try {
-          const res = await fetch(`/api/player-state?sessionId=${sessionId}`);
-          if (res.ok) {
-            const data = await res.json();
-            lastClipId = data?.playerState?.currentClipId || '';
+        // If no saved state, start with random clip
+        if (!currentClip) {
+          const randomClip = await audioDb.getRandomClip(database);
+          if (randomClip) {
+            setCurrentClip(randomClip);
           }
-        } catch {}
-        
-        if (clips.length > 0) {
-          const found = lastClipId && clips.find(c => c._id === lastClipId);
-          setCurrentClip(found || clips[0]);
         }
       } catch (error) {
         console.error('Error initializing player:', error);
@@ -111,17 +102,44 @@ export default function BrowserAudioPlayer() {
     };
   }, [database]);
 
-  // Save last played track to Redis on change
+  // Load clips for a specific page
+  const loadClipsPage = async (page: number) => {
+    setIsLoadingMore(true);
+    try {
+      const result = await audioDb.getClips(database, page, PAGE_SIZE);
+      setDisplayedClips(result.clips);
+      setTotalClips(result.total);
+      setHasMore(result.hasMore);
+      setCurrentPage(page);
+    } catch (error) {
+      console.error('Error loading clips page:', error);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // Load more clips (for pagination)
+  const loadMoreClips = async () => {
+    if (!hasMore || isLoadingMore) return;
+    
+    setIsLoadingMore(true);
+    try {
+      const nextPage = currentPage + 1;
+      const result = await audioDb.getClips(database, nextPage, PAGE_SIZE);
+      setDisplayedClips(prev => [...prev, ...result.clips]);
+      setHasMore(result.hasMore);
+      setCurrentPage(nextPage);
+    } catch (error) {
+      console.error('Error loading more clips:', error);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // Save last played track to localStorage on change
   useEffect(() => {
     if (!currentClip) return;
-    fetch('/api/player-state', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId,
-        playerState: { currentClipId: currentClip._id },
-      }),
-    });
+    localStorageService.updatePlayerState(sessionId, { currentClipId: currentClip._id });
   }, [currentClip, sessionId]);
 
   // Load full transcript when current clip changes
@@ -189,7 +207,7 @@ export default function BrowserAudioPlayer() {
         setSaveMessage('✅ File saved successfully!');
         setFullTranscript(editedTranscript);
         
-        // Update the current clip's transcript and title in the database and memory
+        // Update the current clip's transcript and title
         const updatedClip = {
           ...currentClip,
           transcript: editedTranscript,
@@ -197,8 +215,8 @@ export default function BrowserAudioPlayer() {
         };
         setCurrentClip(updatedClip);
         
-        // Update the clip in the allClips array
-        setAllClips(prevClips => 
+        // Update the clip in the displayed clips array
+        setDisplayedClips(prevClips => 
           prevClips.map(clip => 
             clip._id === currentClip._id 
               ? { 
@@ -217,20 +235,21 @@ export default function BrowserAudioPlayer() {
             await audioDb.updateClipTitle(database, currentClip._id, editedTitle);
           }
         } catch (dbError) {
-          console.log('Database update failed, but file was saved:', dbError);
+          console.error('Database update failed:', dbError);
         }
         
         setIsEditing(false);
         setIsEditingTitle(false);
         
-        // Clear success message after 3 seconds
         setTimeout(() => setSaveMessage(''), 3000);
       } else {
-        setSaveMessage('❌ Error saving file: ' + data.error);
+        setSaveMessage('❌ Error saving file');
+        setTimeout(() => setSaveMessage(''), 3000);
       }
     } catch (error) {
-      console.error('Error saving file:', error);
+      console.error('Error saving transcript:', error);
       setSaveMessage('❌ Error saving file');
+      setTimeout(() => setSaveMessage(''), 3000);
     } finally {
       setIsSaving(false);
     }
@@ -238,31 +257,19 @@ export default function BrowserAudioPlayer() {
 
   const toggleTranscript = () => {
     if (!showTranscript) {
-      setShowTranscript(true);
-      setIsEditing(false);
-      setIsEditingTitle(false);
-      setSaveMessage('');
-    } else {
-      setShowTranscript(false);
-      setFullTranscript('');
-      setEditedTranscript('');
-      setEditedTitle('');
-      setIsEditing(false);
-      setIsEditingTitle(false);
-      setSaveMessage('');
+      loadFullTranscript();
     }
+    setShowTranscript(!showTranscript);
   };
 
   const startEditing = () => {
     setIsEditing(true);
     setEditedTranscript(fullTranscript);
-    setSaveMessage('');
   };
 
   const startEditingTitle = () => {
     setIsEditingTitle(true);
     setEditedTitle(currentClip?.title || '');
-    setSaveMessage('');
   };
 
   const cancelEditing = () => {
@@ -270,23 +277,28 @@ export default function BrowserAudioPlayer() {
     setIsEditingTitle(false);
     setEditedTranscript(fullTranscript);
     setEditedTitle(currentClip?.title || '');
-    setSaveMessage('');
   };
 
-  // Audio event handlers
   const handlePlay = () => {
-    setIsPlaying(true);
-    audioRef.current?.play();
+    if (audioRef.current) {
+      audioRef.current.play();
+      setIsPlaying(true);
+      localStorageService.updatePlayerState(sessionId, { isPlaying: true });
+    }
   };
 
   const handlePause = () => {
-    setIsPlaying(false);
-    audioRef.current?.pause();
+    if (audioRef.current) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+      localStorageService.updatePlayerState(sessionId, { isPlaying: false });
+    }
   };
 
   const handleTimeUpdate = () => {
     if (audioRef.current) {
       setCurrentTime(audioRef.current.currentTime);
+      localStorageService.updatePlayerState(sessionId, { currentTime: audioRef.current.currentTime });
     }
   };
 
@@ -296,6 +308,7 @@ export default function BrowserAudioPlayer() {
     if (audioRef.current) {
       audioRef.current.volume = newVolume;
     }
+    localStorageService.updatePlayerState(sessionId, { volume: newVolume });
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -306,45 +319,61 @@ export default function BrowserAudioPlayer() {
     }
   };
 
-  // Navigation functions
   const goToNext = async () => {
     if (!currentClip) return;
-    const nextClip = await audioDb.getNextClip(database, currentClip._id);
-    if (nextClip) {
-      setCurrentClip(nextClip);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      if (showTranscript) {
+    
+    try {
+      const nextClip = await audioDb.getNextClip(database, currentClip._id);
+      if (nextClip) {
+        setCurrentClip(nextClip);
         setShowTranscript(false);
-        setFullTranscript('');
+        if (audioRef.current) {
+          audioRef.current.currentTime = 0;
+          if (isPlaying) {
+            audioRef.current.play();
+          }
+        }
       }
+    } catch (error) {
+      console.error('Error getting next clip:', error);
     }
   };
 
   const goToPrevious = async () => {
     if (!currentClip) return;
-    const prevClip = await audioDb.getPreviousClip(database, currentClip._id);
-    if (prevClip) {
-      setCurrentClip(prevClip);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      if (showTranscript) {
+    
+    try {
+      const prevClip = await audioDb.getPreviousClip(database, currentClip._id);
+      if (prevClip) {
+        setCurrentClip(prevClip);
         setShowTranscript(false);
-        setFullTranscript('');
+        if (audioRef.current) {
+          audioRef.current.currentTime = 0;
+          if (isPlaying) {
+            audioRef.current.play();
+          }
+        }
       }
+    } catch (error) {
+      console.error('Error getting previous clip:', error);
     }
   };
 
   const goToRandom = async () => {
-    const randomClip = await audioDb.getRandomClip(database);
-    if (randomClip) {
-      setCurrentClip(randomClip);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      if (showTranscript) {
+    try {
+      const randomClip = await audioDb.getRandomClip(database);
+      if (randomClip) {
+        setCurrentClip(randomClip);
         setShowTranscript(false);
-        setFullTranscript('');
+        if (audioRef.current) {
+          audioRef.current.currentTime = 0;
+          if (isPlaying) {
+            audioRef.current.play();
+          }
+        }
       }
+    } catch (error) {
+      console.error('Error getting random clip:', error);
     }
   };
 
@@ -354,251 +383,275 @@ export default function BrowserAudioPlayer() {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  const handleClipSelect = (clip: AudioClip) => {
+    setCurrentClip(clip);
+    setShowTranscript(false);
+    if (audioRef.current) {
+      audioRef.current.currentTime = 0;
+      if (isPlaying) {
+        audioRef.current.play();
+      }
+    }
+  };
+
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-yellow-200 to-yellow-400 p-8 flex items-center justify-center">
+      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-gray-800 mx-auto mb-4"></div>
-          <p className="text-lg text-gray-800">Loading audio clips...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!currentClip) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-yellow-200 to-yellow-400 p-8 flex items-center justify-center">
-        <div className="text-center">
-          <p className="text-lg text-gray-800">No audio clips available</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
+          <p>Loading BMIR Audio Player...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-yellow-200 to-yellow-400 p-8">
-      <div className="max-w-2xl mx-auto bg-white rounded-lg shadow-xl p-8">
-        {/* Title */}
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-gray-800 mb-2">BMIR Audio Player</h1>
-          <h2 className="text-xl text-gray-600">{currentClip.title}</h2>
-          <p className="text-sm text-gray-500 mt-2">
-            {allClips.length} clips available • Browser Version
-          </p>
-        </div>
-
-        {/* Audio Player */}
-        <div className="mb-8">
-          <audio
-            ref={audioRef}
-            src={currentClip.audioUrl}
-            onTimeUpdate={handleTimeUpdate}
-            onEnded={goToNext}
-            onPlay={handlePlay}
-            onPause={handlePause}
-            preload="metadata"
+    <div className="min-h-screen bg-gray-900 text-white">
+      {/* Header */}
+      <div className="bg-gray-800 p-4 border-b border-gray-700">
+        <div className="flex items-center justify-center space-x-4">
+          <img 
+            src="/images/Org.png" 
+            alt="BMIR Logo" 
+            className="h-12 w-auto"
           />
-          
-          {/* Progress Bar */}
-          <div className="mb-4">
-            <input
-              type="range"
-              min="0"
-              max={audioRef.current?.duration || 0}
-              value={currentTime}
-              onChange={handleSeek}
-              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
-            />
-            <div className="flex justify-between text-sm text-gray-500 mt-1">
-              <span>{formatTime(currentTime)}</span>
-              <span>{formatTime(audioRef.current?.duration || 0)}</span>
-            </div>
-          </div>
-
-          {/* Volume Control */}
-          <div className="flex items-center gap-2 mb-4">
-            <span className="text-sm text-gray-600">Volume:</span>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.1"
-              value={volume}
-              onChange={handleVolumeChange}
-              className="w-24 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
-            />
-            <span className="text-sm text-gray-500">{Math.round(volume * 100)}%</span>
+          <div className="text-center">
+            <h1 className="text-2xl font-bold">Random BMIR</h1>
+            <h3 className="text-lg font-medium">{totalClips} Audio Clips </h3>
           </div>
         </div>
+      </div>
 
-        {/* Navigation Controls */}
-        <div className="flex justify-center gap-4 mb-8">
-          <button
-            onClick={goToPrevious}
-            className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
-          >
-            ⏮ Previous
-          </button>
-          
-          <button
-            onClick={isPlaying ? handlePause : handlePlay}
-            className="px-8 py-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
-          >
-            {isPlaying ? '⏸ Pause' : '▶ Play'}
-          </button>
-          
-          <button
-            onClick={goToNext}
-            className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
-          >
-            Next ⏭
-          </button>
-        </div>
-
-        {/* Random Button */}
-        <div className="text-center mb-8">
-          <button
-            onClick={goToRandom}
-            className="px-6 py-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors"
-          >
-            🎲 Random Clip
-          </button>
-        </div>
-
-        {/* Transcript Button */}
-        <div className="text-center mb-8">
-          <button
-            onClick={toggleTranscript}
-            className="px-6 py-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors"
-          >
-            {showTranscript ? '📄 Close Transcript' : '📄 Open Full Transcript'}
-          </button>
-        </div>
-
-        {/* Full Transcript Modal */}
-        {showTranscript && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-            <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[80vh] flex flex-col">
-              <div className="flex justify-between items-center p-6 border-b">
-                <div className="flex-1">
-                  {isEditingTitle ? (
-                    <input
-                      type="text"
-                      value={editedTitle}
-                      onChange={(e) => setEditedTitle(e.target.value)}
-                      className="text-xl font-semibold text-gray-800 bg-transparent border-b border-gray-300 focus:border-blue-500 focus:outline-none w-full"
-                      placeholder="Enter title..."
-                    />
-                  ) : (
-                    <h3 className="text-xl font-semibold text-gray-800">
-                      {currentClip.title}
-                    </h3>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  {!isEditing && !isEditingTitle && (
-                    <>
-                      <button
-                        onClick={startEditingTitle}
-                        className="px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 transition-colors text-sm"
-                      >
-                        ✏️ Edit Title
-                      </button>
-                      <button
-                        onClick={startEditing}
-                        className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors text-sm"
-                      >
-                        ✏️ Edit Transcript
-                      </button>
-                    </>
-                  )}
+      <div className="flex flex-col lg:flex-row h-screen">
+        {/* Main Player Section */}
+        <div className="flex-1 p-6">
+          {currentClip && (
+            <div className="bg-gray-800 rounded-lg p-6 mb-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-semibold">{currentClip.title}</h2>
+                <div className="flex space-x-2">
                   <button
-                    onClick={toggleTranscript}
-                    className="text-gray-500 hover:text-gray-700 text-2xl"
+                    onClick={goToPrevious}
+                    className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm"
                   >
-                    ×
+                    ⏮ Previous
+                  </button>
+                  <button
+                    onClick={goToRandom}
+                    className="bg-green-600 hover:bg-green-700 px-3 py-1 rounded text-sm"
+                  >
+                    🎲 Random
+                  </button>
+                  <button
+                    onClick={goToNext}
+                    className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm"
+                  >
+                    ⏭ Next
                   </button>
                 </div>
               </div>
-              
-              {/* Save Message */}
-              {saveMessage && (
-                <div className={`px-6 py-2 text-sm ${
-                  saveMessage.includes('✅') ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                }`}>
-                  {saveMessage}
-                </div>
-              )}
-              
-              <div className="flex-1 overflow-y-auto p-6">
-                {isLoadingTranscript ? (
-                  <div className="flex items-center justify-center h-32">
-                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-800"></div>
-                    <span className="ml-2">Loading transcript...</span>
+
+              <audio
+                ref={audioRef}
+                src={currentClip.audioUrl}
+                onTimeUpdate={handleTimeUpdate}
+                onEnded={goToNext}
+                onLoadedMetadata={() => {
+                  if (audioRef.current) {
+                    audioRef.current.volume = volume;
+                  }
+                }}
+              />
+
+              <div className="space-y-4">
+                {/* Progress Bar */}
+                <div>
+                  <input
+                    type="range"
+                    min="0"
+                    max={audioRef.current?.duration || 0}
+                    value={currentTime}
+                    onChange={handleSeek}
+                    className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                  />
+                  <div className="flex justify-between text-sm text-gray-400 mt-1">
+                    <span>{formatTime(currentTime)}</span>
+                    <span>{formatTime(audioRef.current?.duration || 0)}</span>
                   </div>
-                ) : (isEditing || isEditingTitle) ? (
-                  <div className="space-y-4">
-                    {isEditing && (
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Transcript:
-                        </label>
-                        <textarea
-                          value={editedTranscript}
-                          onChange={(e) => setEditedTranscript(e.target.value)}
-                          className="w-full h-96 p-4 border border-gray-300 rounded-lg resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                          placeholder="Edit the transcript here..."
-                        />
+                </div>
+
+                {/* Controls */}
+                <div className="flex items-center space-x-4">
+                  <button
+                    onClick={isPlaying ? handlePause : handlePlay}
+                    className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg font-semibold"
+                  >
+                    {isPlaying ? '⏸ Pause' : '▶ Play'}
+                  </button>
+
+                  <div className="flex items-center space-x-2">
+                    <span className="text-sm">🔊</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.1"
+                      value={volume}
+                      onChange={handleVolumeChange}
+                      className="w-20 h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+                </div>
+
+                {/* Transcript Section */}
+                <div className="border-t border-gray-700 pt-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <button
+                      onClick={toggleTranscript}
+                      className="text-blue-400 hover:text-blue-300 text-sm"
+                    >
+                      {showTranscript ? 'Hide' : 'Show'} Transcript
+                    </button>
+                    {showTranscript && (
+                      <div className="flex space-x-2">
+                        <button
+                          onClick={startEditingTitle}
+                          className="text-yellow-400 hover:text-yellow-300 text-xs"
+                        >
+                          Edit Title
+                        </button>
+                        <button
+                          onClick={startEditing}
+                          className="text-green-400 hover:text-green-300 text-xs"
+                        >
+                          Edit Transcript
+                        </button>
                       </div>
                     )}
-                    <div className="flex justify-end gap-2">
-                      <button
-                        onClick={cancelEditing}
-                        className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors"
-                        disabled={isSaving}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={saveTranscript}
-                        className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 transition-colors flex items-center gap-2"
-                        disabled={isSaving}
-                      >
-                        {isSaving ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                            Saving...
-                          </>
-                        ) : (
-                          '💾 Save'
-                        )}
-                      </button>
+                  </div>
+
+                  {showTranscript && (
+                    <div className="bg-gray-700 rounded p-3">
+                      {isLoadingTranscript ? (
+                        <div className="text-center py-4">
+                          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white mx-auto"></div>
+                          <p className="mt-2 text-sm">Loading transcript...</p>
+                        </div>
+                      ) : isEditing || isEditingTitle ? (
+                        <div className="space-y-3">
+                          {isEditingTitle && (
+                            <div>
+                              <label className="block text-sm font-medium mb-1">Title:</label>
+                              <input
+                                type="text"
+                                value={editedTitle}
+                                onChange={(e) => setEditedTitle(e.target.value)}
+                                className="w-full p-2 bg-gray-600 border border-gray-500 rounded text-white"
+                              />
+                            </div>
+                          )}
+                          {isEditing && (
+                            <div>
+                              <label className="block text-sm font-medium mb-1">Transcript:</label>
+                              <textarea
+                                value={editedTranscript}
+                                onChange={(e) => setEditedTranscript(e.target.value)}
+                                rows={8}
+                                className="w-full p-2 bg-gray-600 border border-gray-500 rounded text-white resize-none"
+                              />
+                            </div>
+                          )}
+                          <div className="flex space-x-2">
+                            <button
+                              onClick={saveTranscript}
+                              disabled={isSaving}
+                              className="bg-green-600 hover:bg-green-700 px-3 py-1 rounded text-sm disabled:opacity-50"
+                            >
+                              {isSaving ? 'Saving...' : 'Save'}
+                            </button>
+                            <button
+                              onClick={cancelEditing}
+                              className="bg-gray-600 hover:bg-gray-700 px-3 py-1 rounded text-sm"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                          {saveMessage && (
+                            <p className="text-sm">{saveMessage}</p>
+                          )}
+                        </div>
+                      ) : (
+                        <div>
+                          <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                            {fullTranscript}
+                          </p>
+                        </div>
+                      )}
                     </div>
-                  </div>
-                ) : (
-                  <div className="whitespace-pre-wrap text-gray-700 leading-relaxed">
-                    {fullTranscript}
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
-        {/* Clip Info */}
-        <div className="mt-8 p-4 bg-gray-50 rounded-lg">
-          <h3 className="font-semibold text-gray-800 mb-2">Clip Information</h3>
-          <div className="text-sm text-gray-600 space-y-1">
-            <p><strong>Category:</strong> {currentClip.category}</p>
-            <p><strong>Filename:</strong> {currentClip.filename}</p>
-            <p><strong>Status:</strong> Browser-compatible version (no Redis/Fireproof)</p>
-            {currentClip.transcript && (
-              <div className="mt-4">
-                <p><strong>Transcript Preview:</strong></p>
-                <p className="text-xs text-gray-500 mt-1 line-clamp-3">{currentClip.transcript}</p>
-              </div>
-            )}
+        {/* Clip List Section */}
+        <div className="w-full lg:w-80 bg-gray-800 border-l border-gray-700 p-4 overflow-y-auto">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold">Audio Clips</h3>
+            <span className="text-sm text-gray-400">{totalClips} total</span>
           </div>
+
+          {/* <div className="space-y-2">
+            {displayedClips.map((clip) => (
+              <div
+                key={clip._id}
+                onClick={() => handleClipSelect(clip)}
+                className={`p-3 rounded cursor-pointer transition-colors ${
+                  currentClip?._id === clip._id
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                <div className="font-medium text-sm">{clip.title}</div>
+                <div className="text-xs text-gray-400 mt-1">
+                  {clip.category} • {clip.filename}
+                </div>
+              </div>
+            ))}
+          </div> */}
+{/* 
+          {hasMore && (
+            <button
+              onClick={loadMoreClips}
+              disabled={isLoadingMore}
+              className="w-full mt-4 bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm disabled:opacity-50"
+            >
+              {isLoadingMore ? 'Loading...' : 'Load More Clips'}
+            </button>
+          )} */}
+
+          {/* {displayedClips.length === 0 && !isLoadingMore && (
+            <div className="text-center py-8 text-gray-400">
+              <p>No clips loaded</p>
+            </div>
+          )} */}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="bg-gray-800 border-t border-gray-700 p-4 text-center text-sm text-gray-400">
+        <div className="flex justify-center items-center space-x-4">
+          <a 
+            href="/ckdb" 
+            className="text-blue-400 hover:text-blue-300 underline transition-colors"
+          >
+            🗄️ Database Inspector
+          </a>
+          <span className="text-gray-500">•</span>
+          <span>Session: {sessionId.substring(0, 8)}...</span>
+          <span className="text-gray-500">•</span>
+          <span>{totalClips} clips available</span>
         </div>
       </div>
     </div>
